@@ -620,8 +620,23 @@ class RemoteMicForegroundService : Service() {
             }
 
             resetWatchdog()
-            speechRecognizer?.startListening(intent)
             isCurrentlyRecognizing = true
+            // FIX PTT: Android 12+ a veces IGNORA startListening() inmediato tras cancel()
+            // (carrera interna del motor): el usuario mantiene presionado y nunca escucha.
+            // Dar ~80ms para que el motor libere la sesion anterior antes de arrancar.
+            mainHandler.postDelayed({
+                if (!isListeningLoopActive && !isManualPushToTalk) {
+                    isCurrentlyRecognizing = false
+                    return@postDelayed
+                }
+                try {
+                    speechRecognizer?.startListening(intent)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error starting speech recognition (delayed)", e)
+                    isCurrentlyRecognizing = false
+                    scheduleNextRecognition(400L)
+                }
+            }, 80L)
         } catch (e: Exception) {
             Log.e(TAG, "Error starting speech recognition", e)
             isCurrentlyRecognizing = false
@@ -730,7 +745,7 @@ class RemoteMicForegroundService : Service() {
                         if (isManualPushToTalk && isPhysicalPttHolding) {
                             startSpeechRecognitionSafely()
                         }
-                    }, 40L)
+                    }, 150L)
                     return
                 }
 
@@ -794,7 +809,7 @@ class RemoteMicForegroundService : Service() {
                             if (isManualPushToTalk && isPhysicalPttHolding) {
                                 startSpeechRecognitionSafely()
                             }
-                        }, 40L)
+                        }, 150L)
                         return
                     } else {
                         // User has released the button: process results now
