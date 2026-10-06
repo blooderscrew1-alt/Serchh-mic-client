@@ -1,0 +1,8 @@
+{
+  "name": "SerchTube Music PC",
+  "description": "Cliente de micrófono remoto ligero y eficiente para capturar órdenes de voz y controlar la reproducción de música en un dispositivo principal por red Wi-Fi.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
