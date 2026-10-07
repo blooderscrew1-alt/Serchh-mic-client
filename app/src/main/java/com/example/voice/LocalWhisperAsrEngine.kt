@@ -211,6 +211,21 @@ class LocalWhisperAsrEngine(
 
                                 val clientSettings = com.example.data.ClientSettings(context)
                                 if (clientSettings.wakeWordTriggersHostMicDirectly) {
+                                    // 🛡️ Anti-falso-positivo: Whisper alucina sobre musica/ruido
+                                    // transcribiendo palabras comunes ("musica"). Exigir transcripciones
+                                    // cortas (comando real) y periodo refractario de 8s.
+                                    val nowMs = System.currentTimeMillis()
+                                    if (nowMs - lastInstantWakeTriggerAt < 8000L) {
+                                        Log.i(TAG, "ANTI_FP: Whisper dentro del periodo refractario (8s), ignorado.")
+                                        currentState = AsrFsmState.ESPERANDO_WAKE_WORD
+                                        return
+                                    }
+                                    if (lastWakeTranscript.length > 60) {
+                                        Log.i(TAG, "ANTI_FP: Whisper transcript largo (${lastWakeTranscript.length} chars): probable alucinacion/letra, ignorado.")
+                                        currentState = AsrFsmState.ESPERANDO_WAKE_WORD
+                                        return
+                                    }
+                                    lastInstantWakeTriggerAt = nowMs
                                     Log.i(TAG, "EVENT: Wake Word Detected -> Instant Host Mic Activation (skipping State 2 & 3)")
                                     com.example.network.RemoteClientHolder.getClient(context).sendInstantHostMicActivation(
                                         hostIp = clientSettings.hostIp,
@@ -427,7 +442,11 @@ class LocalWhisperAsrEngine(
     /**
      * Verifica si el texto transcrito contiene la palabra clave configurada de forma estricta.
      */
+    private var lastWakeTranscript: String = ""
+    private var lastInstantWakeTriggerAt: Long = 0L
+
     private fun containsWakeWord(text: String): Boolean {
+        lastWakeTranscript = text
         if (text.isBlank()) return false
         val configuredWakeWord = try {
             com.example.data.ClientSettings(context).wakeWord

@@ -898,7 +898,17 @@ class RemoteMicForegroundService : Service() {
      */
     private fun triggerInstantHostMicOnWakeWord(spokenWakeWord: String, rawText: String) {
         val now = System.currentTimeMillis()
-        if (now - lastInstantHostMicTriggerTime < 1800L) {
+        // 🛡️ Anti-falso-positivo 1: letras de canciones / frases largas que INICIAN con la
+        // palabra clave no son comandos ("musica es mi companion de viaje..."). Los comandos
+        // reales tras la palabra clave son cortos (<= 8 palabras).
+        val wordCount = rawText.trim().split(Regex("\s+")).size
+        if (wordCount > 8) {
+            Log.i(TAG, "ANTI_FP: Texto de ${wordCount} palabras tras la palabra clave: probable letra/frase, ignorado.")
+            return
+        }
+        // 🛡️ Anti-falso-positivo 2: periodo refractario de 8s (antes 1.8s) para que la
+        // propia musica con la palabra en la letra no reactive el micro del host en bucle.
+        if (now - lastInstantHostMicTriggerTime < 8000L) {
             return
         }
         lastInstantHostMicTriggerTime = now
