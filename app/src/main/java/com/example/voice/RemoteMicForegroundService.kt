@@ -5,8 +5,10 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.media.AudioFormat
 import android.media.AudioManager
@@ -37,7 +39,6 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import java.util.Locale
 
 class RemoteMicForegroundService : Service() {
 
@@ -69,6 +70,98 @@ class RemoteMicForegroundService : Service() {
     private var meshWinnerNodeName = ""
     @Volatile
     private var lastObservedRms = 0f
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // DIAGNÓSTICO Y AUTORREPARACIÓN DEL MOTOR DE VOZ DEL SISTEMA
+    // Muchos fabricantes (MIUI/HyperOS, EMUI, ColorOS...) traen por defecto un
+    // servicio de reconocimiento propio que no devuelve texto con los extras
+    // que usamos, mientras que la onda del micrófono SÍ se mueve (onRmsChanged).
+    // Estas variables permiten detectar ese escenario, reportarlo en el registro
+    // en pantalla y degradar el intento automáticamente.
+    // ─────────────────────────────────────────────────────────────────────────
+    /** Componente del motor de reconocimiento elegido (null = predeterminado del sistema). */
+    private var recognizerComponent: ComponentName? = null
+
+    /** Etiqueta legible del motor en uso para los registros. */
+    private var recognizerEngineLabel: String = "predeterminado del sistema"
+
+    /** 0 = intento completo, 1 = intento mínimo, 2 = intento mínimo + preferir offline. */
+    private var recognizerProfile = 0
+
+    /** Fallos consecutivos reales del motor (no cuentan los cierres por silencio). */
+    private var recognizerFailureStreak = 0
+
+    /** Total de fallos reales del motor desde el arranque de la escucha. */
+    private var recognizerEngineFailures = 0
+
+    /** Total de sesiones cerradas por silencio/ruido (funcionamiento normal). */
+    private var recognizerSilentSessions = 0
+
+    /** Nº de errores onError recibidos (para el registro). */
+    private var recognizerErrorCount = 0
+
+    /** Nº de eventos con texto devueltos por el motor. */
+    private var recognizerTextEventCount = 0
+
+    /** Marca de tiempo del último texto devuelto por el motor. */
+    @Volatile
+    private var lastRecognizerTextAt = 0L
+
+    /** Marca de tiempo del último sonido relevante visto por el medidor del reconocedor. */
+    @Volatile
+    private var lastSpeechEnergyAt = 0L
+
+    /** Momento en el que se pidió escucha al motor actual. */
+    private var recognizerListeningSince = 0L
+
+    /** Evita repetir el aviso de "motor sin respuesta" en bucle. */
+    private var engineUnresponsiveWarned = false
+
+    /** Indica si el chequeo periódico de salud del motor está programado. */
+    private var engineHealthScheduled = false
+
+    /** Si es true, se intenta primero el motor de Google (el más fiable en MIUI/HyperOS). */
+    private var preferPreferredRecognizer = true
+
+    private val preferredRecognizerPackages = listOf(
+        "com.google.android.googlequicksearchbox",
+        "com.google.android.tts",
+        "com.google.android.apps.googleassistant"
+    )
+
+    private val engineHealthRunnable = object : Runnable {
+        override fun run() {
+            if (isListeningLoopActive && !isManualPushToTalk) {
+                val now = System.currentTimeMillis()
+                val reference = maxOf(lastRecognizerTextAt, recognizerListeningSince)
+                val noTextForMs = if (reference > 0L) now - reference else 0L
+                val hasRecentVoice = now - lastSpeechEnergyAt < 6000L
+
+                if (!engineUnresponsiveWarned && hasRecentVoice && noTextForMs > 20000L) {
+                    engineUnresponsiveWarned = true
+                    val seconds = noTextForMs / 1000L
+                    val diagnosis =
+                        "⚠️ DIAGNÓSTICO DE VOZ: el micrófono capta sonido (la onda se mueve) pero el motor de voz " +
+                        "'$recognizerEngineLabel' lleva ${seconds}s sin devolver texto (fallos=$recognizerEngineFailures, " +
+                        "errores=$recognizerErrorCount, silencios=$recognizerSilentSessions, Android ${Build.VERSION.RELEASE}). " +
+                        "En MIUI/HyperOS revisa: 1) Ajustes → Aplicaciones → Administrar aplicaciones → ⋮ → Aplicaciones predeterminadas " +
+                        "→ Asistencia y entrada de voz → Entrada de voz = Google; 2) que 'Speech Services by Google' y la app 'Google' " +
+                        "estén habilitadas y actualizadas, con el paquete de idioma español descargado; " +
+                        "3) Ahorro de batería SIN restricciones + inicio automático + datos en segundo plano permitidos " +
+                        "para esta app y para Google."
+                    Log.w(TAG, diagnosis)
+                    ClientStateHolder.addLog(diagnosis, isError = true)
+                    ClientStateHolder.setMicState(
+                        ClientMicState.LISTENING_STANDBY,
+                        "⚠️ El motor de voz no responde en este teléfono (ver registro)"
+                    )
+                }
+                mainHandler.postDelayed(this, 5000L)
+            } else {
+                mainHandler.postDelayed(this, 5000L)
+            }
+        }
+    }
 
     private fun cancelActiveCaptureForMesh(winnerName: String, reason: String) {
         serviceScope.launch(Dispatchers.Main) {
@@ -254,6 +347,7 @@ class RemoteMicForegroundService : Service() {
         isManualPushToTalk = false
         isWakeWordActiveWindow = false
         applyBeepSuppression(true)
+        resetRecognizerDiagnostics()
 
         val standbyMsg = if (settings.directCommandsEnabled) {
             "🎤 Escuchando... ('${settings.wakeWord}' o comandos directos)"
@@ -505,6 +599,163 @@ class RemoteMicForegroundService : Service() {
         }
     }
 
+    /**
+     * Enumera los servicios de reconocimiento de voz visibles para la app.
+     * El manifiesto ya declara <queries> para "android.speech.RecognitionService",
+     * por lo que en Android 11+ estos paquetes son visibles.
+     */
+    private fun listRecognitionServices(): List<ComponentName> {
+        return try {
+            val pm = packageManager
+            val intent = Intent("android.speech.RecognitionService")
+            val resolved = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                pm.queryIntentServices(
+                    intent,
+                    PackageManager.ResolveInfoFlags.of(PackageManager.MATCH_ALL.toLong())
+                )
+            } else {
+                @Suppress("DEPRECATION")
+                pm.queryIntentServices(intent, PackageManager.MATCH_ALL)
+            }
+            resolved.mapNotNull { info ->
+                val si = info.serviceInfo ?: return@mapNotNull null
+                ComponentName(si.packageName, si.name)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "No se pudieron enumerar los servicios de reconocimiento: ${e.message}")
+            emptyList()
+        }
+    }
+
+    private fun pickPreferredRecognizerComponent(services: List<ComponentName>): ComponentName? {
+        for (pkg in preferredRecognizerPackages) {
+            services.firstOrNull { it.packageName == pkg }?.let { return it }
+        }
+        return null
+    }
+
+    private fun recognizerProfileName(profile: Int): String = when (profile) {
+        0 -> "completo (idioma principal + idiomas adicionales)"
+        1 -> "mínimo (solo idioma principal)"
+        else -> "mínimo + preferir reconocimiento offline"
+    }
+
+    private fun recognizerErrorName(code: Int): String = when (code) {
+        1 -> "ERROR_NETWORK_TIMEOUT"
+        2 -> "ERROR_NETWORK (el motor no tiene red)"
+        3 -> "ERROR_AUDIO (fallo de captura del reconocedor)"
+        4 -> "ERROR_SERVER (el servicio de voz rechazó la petición)"
+        5 -> "ERROR_CLIENT (sesión inválida o permiso)"
+        6 -> "ERROR_SPEECH_TIMEOUT (fin por silencio)"
+        7 -> "ERROR_NO_MATCH (fin por silencio/ruido)"
+        8 -> "ERROR_RECOGNIZER_BUSY"
+        9 -> "ERROR_INSUFFICIENT_PERMISSIONS"
+        12 -> "ERROR_LANGUAGE_NOT_SUPPORTED"
+        13 -> "ERROR_LANGUAGE_UNAVAILABLE"
+        else -> "ERROR_CODE_$code"
+    }
+
+    /**
+     * Construye la intención de reconocimiento según el perfil adaptativo actual.
+     */
+    private fun buildRecognizerIntent(): Intent {
+        val langMode = settings.speechLanguageMode
+        val primaryLanguage = when (langMode) {
+            "en" -> "en-US"
+            else -> "es-ES"
+        }
+
+        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 6)
+            putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, applicationContext.packageName)
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, primaryLanguage)
+        }
+
+        if (recognizerProfile == 0) {
+            intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, primaryLanguage)
+            when (langMode) {
+                "en" -> intent.putExtra(
+                    "android.speech.extra.EXTRA_ADDITIONAL_LANGUAGES",
+                    arrayOf("en-US", "en-GB")
+                )
+                "es" -> intent.putExtra(
+                    "android.speech.extra.EXTRA_ADDITIONAL_LANGUAGES",
+                    arrayOf("es-419", "es-ES", "es-US", "es-MX")
+                )
+                else -> intent.putExtra(
+                    "android.speech.extra.EXTRA_ADDITIONAL_LANGUAGES",
+                    arrayOf("es-419", "es-US", "es-MX", "en-US")
+                )
+            }
+            intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1200L)
+            intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1000L)
+            intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 500L)
+        }
+
+        if (recognizerProfile >= 2) {
+            intent.putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
+        }
+
+        return intent
+    }
+
+    /**
+     * Si el motor acumula fallos seguidos, se simplifica el intento y, como último
+     * recurso, se vuelve al motor predeterminado del sistema.
+     */
+    private fun escalateRecognizerProfile(reason: String) {
+        if (recognizerProfile < 2) {
+            recognizerProfile++
+            recognizerFailureStreak = 0
+            val message = "🔧 Motor de voz: reintentando en modo '${recognizerProfileName(recognizerProfile)}' por $reason"
+            Log.w(TAG, message)
+            ClientStateHolder.addLog(message)
+            return
+        }
+
+        if (recognizerComponent != null) {
+            recognizerComponent = null
+            recognizerProfile = 0
+            recognizerFailureStreak = 0
+            preferPreferredRecognizer = false
+            val message = "🔧 Motor de voz: volviendo al motor predeterminado del sistema por $reason"
+            Log.w(TAG, message)
+            ClientStateHolder.addLog(message)
+            initSpeechRecognizer()
+        }
+    }
+
+    /**
+     * Registra que el motor SÍ está devolviendo texto (funciona) y lo refleja en el log en pantalla.
+     */
+    private fun registerRecognizerText(text: String, kind: String) {
+        lastRecognizerTextAt = System.currentTimeMillis()
+        recognizerTextEventCount++
+        engineUnresponsiveWarned = false
+        if (recognizerTextEventCount <= 5 || recognizerTextEventCount % 50 == 0) {
+            ClientStateHolder.addLog("🗣️ Texto del motor ($kind): \"$text\"")
+        }
+    }
+
+    private fun resetRecognizerDiagnostics() {
+        recognizerFailureStreak = 0
+        recognizerEngineFailures = 0
+        recognizerSilentSessions = 0
+        recognizerErrorCount = 0
+        recognizerTextEventCount = 0
+        lastRecognizerTextAt = 0L
+        engineUnresponsiveWarned = false
+        preferPreferredRecognizer = true
+    }
+
+    private fun scheduleEngineHealthCheck() {
+        if (engineHealthScheduled) return
+        engineHealthScheduled = true
+        mainHandler.postDelayed(engineHealthRunnable, 5000L)
+    }
+
     private fun initSpeechRecognizer() {
         try {
             speechRecognizer?.destroy()
@@ -515,12 +766,48 @@ class RemoteMicForegroundService : Service() {
                     ClientMicState.COMMAND_ERROR,
                     "Reconocedor de voz no disponible en el sistema"
                 )
+                val missingMsg =
+                    "❌ Este dispositivo no expone ningún servicio de reconocimiento de voz " +
+                    "(Android ${Build.VERSION.RELEASE}, ${Build.MANUFACTURER} ${Build.MODEL}). " +
+                    "Instala o habilita 'Speech Services by Google' y selecciónalo en " +
+                    "Ajustes → Sistema → Idiomas e introducción → Entrada de voz."
+                Log.e(TAG, missingMsg)
+                ClientStateHolder.addLog(missingMsg, isError = true)
                 return
             }
 
-            speechRecognizer = SpeechRecognizer.createSpeechRecognizer(applicationContext).apply {
-                setRecognitionListener(createRecognitionListener())
+            val services = listRecognitionServices()
+            val chosen = if (preferPreferredRecognizer) pickPreferredRecognizerComponent(services) else null
+            val availableList = if (services.isEmpty()) {
+                "no enumerables"
+            } else {
+                services.joinToString(", ") { it.packageName }
             }
+
+            var created: SpeechRecognizer? = null
+            if (chosen != null) {
+                try {
+                    created = SpeechRecognizer.createSpeechRecognizer(applicationContext, chosen)
+                    recognizerComponent = chosen
+                    recognizerEngineLabel = chosen.packageName
+                } catch (e: Exception) {
+                    Log.w(TAG, "No se pudo usar el motor ${chosen.packageName}: ${e.message}")
+                    created = null
+                }
+            }
+
+            if (created == null) {
+                recognizerComponent = null
+                recognizerEngineLabel = services.firstOrNull()?.packageName ?: "predeterminado del sistema"
+                created = SpeechRecognizer.createSpeechRecognizer(applicationContext)
+            }
+
+            speechRecognizer = created.apply { setRecognitionListener(createRecognitionListener()) }
+            scheduleEngineHealthCheck()
+
+            val engineMsg = "🎙️ Motor de voz en uso: $recognizerEngineLabel (disponibles: $availableList)"
+            Log.i(TAG, engineMsg)
+            ClientStateHolder.addLog(engineMsg)
         } catch (e: Exception) {
             Log.e(TAG, "Failed to create SpeechRecognizer", e)
         }
@@ -586,38 +873,10 @@ class RemoteMicForegroundService : Service() {
                 speechRecognizer?.cancel()
             } catch (_: Exception) {}
 
-            val langMode = settings.speechLanguageMode
-            val defaultLocale = Locale.getDefault()
-            val defaultLanguageTag = defaultLocale.toLanguageTag()
-
-            val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-                putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-                putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-                putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 6)
-                putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, applicationContext.packageName)
-                
-                when (langMode) {
-                    "en" -> {
-                        putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-US")
-                        putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "en-US")
-                        putExtra("android.speech.extra.EXTRA_ADDITIONAL_LANGUAGES", arrayOf("en-US", "en-GB"))
-                    }
-                    "es" -> {
-                        putExtra(RecognizerIntent.EXTRA_LANGUAGE, "es-ES")
-                        putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "es-ES")
-                        putExtra("android.speech.extra.EXTRA_ADDITIONAL_LANGUAGES", arrayOf("es-419", "es-ES", "es-US", "es-MX"))
-                    }
-                    else -> { // "bilingual" (Default) - Spanish primary with secondary English vocabulary
-                        putExtra(RecognizerIntent.EXTRA_LANGUAGE, "es-ES")
-                        putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "es-ES")
-                        putExtra("android.speech.extra.EXTRA_ADDITIONAL_LANGUAGES", arrayOf("es-419", "es-US", "es-MX", "en-US"))
-                    }
-                }
-
-                putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1200L)
-                putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1000L)
-                putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 500L)
-            }
+            // Intención adaptativa: si el motor falla de forma persistente en este
+            // dispositivo, se simplifica automáticamente (ver escalateRecognizerProfile).
+            val intent = buildRecognizerIntent()
+            recognizerListeningSince = System.currentTimeMillis()
 
             resetWatchdog()
             isCurrentlyRecognizing = true
@@ -721,6 +980,10 @@ class RemoteMicForegroundService : Service() {
                 if (rmsdB > 0.5f) {
                     resetWatchdog()
                 }
+                // Señal de que el micrófono está captando sonido de verdad (la onda se mueve)
+                if (rmsdB > 1.0f) {
+                    lastSpeechEnergyAt = System.currentTimeMillis()
+                }
                 val normalized = ((rmsdB + 2f) / 1.2f).coerceIn(0f, 10f)
                 lastObservedRms = normalized
                 ClientStateHolder.setRms(normalized)
@@ -781,12 +1044,47 @@ class RemoteMicForegroundService : Service() {
                     )
                 }
 
+                // ── Diagnóstico del motor de voz ───────────────────────────────
+                // Los cierres por silencio (NO_MATCH / SPEECH_TIMEOUT) son normales
+                // en escucha continua; solo los errores reales de motor indican
+                // que el reconocedor del dispositivo no está funcionando.
+                val isSilenceEnd = error == SpeechRecognizer.ERROR_NO_MATCH ||
+                        error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT
+                recognizerErrorCount++
+
+                if (isSilenceEnd) {
+                    recognizerSilentSessions++
+                    if (recognizerSilentSessions <= 3) {
+                        ClientStateHolder.addLog(
+                            "🔇 Sesión cerrada por silencio (${recognizerErrorName(error)}) — el motor responde con normalidad."
+                        )
+                    }
+                } else {
+                    recognizerEngineFailures++
+                    recognizerFailureStreak++
+                    if (recognizerEngineFailures <= 10 || recognizerEngineFailures % 50 == 0) {
+                        ClientStateHolder.addLog(
+                            "⚠️ Fallo del motor de voz: ${recognizerErrorName(error)} " +
+                            "(motor=$recognizerEngineLabel, modo=${recognizerProfileName(recognizerProfile)}, " +
+                            "fallos seguidos=$recognizerFailureStreak)"
+                        )
+                    }
+                    if (recognizerFailureStreak >= 5) {
+                        val reason = recognizerErrorName(error)
+                        recognizerFailureStreak = 0
+                        escalateRecognizerProfile(reason)
+                    }
+                }
+
                 if (isListeningLoopActive) {
+                    // Backoff progresivo: no martillear el motor con reinicios de 80 ms
+                    // cuando está devolviendo errores reales.
+                    val retryDelay = if (isSilenceEnd) 80L else (200L * recognizerFailureStreak.coerceAtLeast(1)).coerceAtMost(2500L)
                     if (error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY || error == SpeechRecognizer.ERROR_CLIENT) {
                         initSpeechRecognizer()
-                        scheduleNextRecognition(250L)
+                        scheduleNextRecognition(maxOf(300L, retryDelay))
                     } else {
-                        scheduleNextRecognition(80L)
+                        scheduleNextRecognition(retryDelay)
                     }
                 }
             }
@@ -799,6 +1097,7 @@ class RemoteMicForegroundService : Service() {
                 val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION) ?: arrayListOf()
                 val text = matches.firstOrNull()?.trim() ?: ""
                 if (text.isNotBlank()) {
+                    registerRecognizerText(text, "final")
                     accumulatedPttText = text
                 }
 
@@ -827,6 +1126,7 @@ class RemoteMicForegroundService : Service() {
                 val matches = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                 val text = matches?.firstOrNull()?.trim() ?: ""
                 if (text.isNotBlank()) {
+                    registerRecognizerText(text, "parcial")
                     if (isManualPushToTalk) {
                         accumulatedPttText = text
                     }
@@ -846,6 +1146,10 @@ class RemoteMicForegroundService : Service() {
                     // 1. WAKE-WORD WINDOW TRIGGER:
                     // If wake word is heard in partial speech, duck/mute multimedia audio, open listening popup and keep window open
                     if (isWakeDetected && !isWakeWordActiveWindow) {
+                        ClientStateHolder.addLog(
+                            "✅ Palabra clave '${settings.wakeWord}' detectada en: \"$text\"",
+                            isIncoming = true
+                        )
                         isWakeWordActiveWindow = true
                         requestTransientAudioFocus()
                         val windowMs = settings.wakeWindowSeconds * 1000L
@@ -1735,6 +2039,7 @@ class RemoteMicForegroundService : Service() {
         isCurrentlyRecognizing = false
         isWakeWordActiveWindow = false
         mainHandler.removeCallbacksAndMessages(null)
+        engineHealthScheduled = false
 
         try {
             speechRecognizer?.cancel()
